@@ -1,108 +1,123 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <arpa/inet.h>
 #include "common.h"
 
-#define BUFSZ 500
+// Códigos de mensagens
+#define REQ_USRADD 33
+#define REQ_USRACCESS 34
+#define RES_USRACCESS 35
+#define REQ_LOCREG 36
+#define REQ_USRLOC 38
+#define RES_USRLOC 39
+#define ERROR 255
+#define OK 0
 
-void error_exit(const char *msg) {
-    perror(msg);
-    exit(EXIT_FAILURE);
-}
+int connect_to_server(const char *host, const char *port) {
+    struct sockaddr_in addr4;
+    memset(&addr4, 0, sizeof(addr4));
+    addr4.sin_family = AF_INET;
+    addr4.sin_port = htons(atoi(port));
 
-void send_message(int sockfd, unsigned char msg_type, const char *payload) {
-    unsigned char buffer[BUFSZ] = {0};
-    buffer[0] = msg_type;
-    if (payload) {
-        strncpy((char *)(buffer + 1), payload, BUFSZ - 1);
+    if (inet_pton(AF_INET, host, &addr4.sin_addr) <= 0) {
+        perror("Erro ao interpretar o endereço IPv4");
+        return -1;
     }
-    if (send(sockfd, buffer, strlen((char *)buffer), 0) < 0) {
-        error_exit("ERROR sending message");
-    }
-}
 
-void receive_message(int sockfd) {
-    unsigned char buffer[BUFSZ] = {0};
-    if (recv(sockfd, buffer, BUFSZ, 0) <= 0) {
-        error_exit("ERROR receiving message");
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == -1) {
+        perror("Erro ao criar socket");
+        return -1;
     }
-    printf("Server response: %s\n", buffer + 1);
+
+    if (connect(s, (struct sockaddr *)&addr4, sizeof(addr4)) != 0) {
+        perror("Erro ao conectar ao servidor");
+        close(s);
+        return -1;
+    }
+
+    fprintf(stdout, "Conexão bem-sucedida com %s:%s\n", host, port);
+    return s;
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 5) {
-        fprintf(stderr, "Usage: %s <server-SU-IP> <server-SU-port> <server-SL-port> <location-code>\n", argv[0]);
+    if (argc < 5) {
+        fprintf(stderr, "Uso: %s <SU_HOST> <SU_PORT> <SL_PORT> <CLIENT_ID>\n", argv[0]);
         exit(EXIT_FAILURE);
     }
 
-    int location = atoi(argv[4]);
-    if (location < 1 || location > 10) {
-        fprintf(stderr, "Invalid location code. Must be between 1 and 10.\n");
-        exit(EXIT_FAILURE);
-    }
+    const char *su_host = argv[1];
+    const char *su_port = argv[2];
+    const char *sl_port = argv[3];
 
-    int su_sock, sl_sock;
-    struct sockaddr_storage su_addr, sl_addr;
+    int su_sock = connect_to_server(su_host, su_port);
+    if (su_sock < 0) exit(EXIT_FAILURE);
 
-    // Conectar ao servidor SU
-    if (addrparse(argv[1], argv[2], &su_addr) != 0) {
-        error_exit("Error parsing SU address");
-    }
-    su_sock = socket(su_addr.ss_family, SOCK_STREAM, IPPROTO_TCP);
-    if (connect(su_sock, (struct sockaddr *)&su_addr, sizeof(su_addr)) < 0) {
-        error_exit("Error connecting to SU");
-    }
+    int sl_sock = connect_to_server(su_host, sl_port);
+    if (sl_sock < 0) exit(EXIT_FAILURE);
 
-    // Conectar ao servidor SL
-    if (addrparse(argv[1], argv[3], &sl_addr) != 0) {
-        error_exit("Error parsing SL address");
-    }
-    sl_sock = socket(sl_addr.ss_family, SOCK_STREAM, IPPROTO_TCP);
-    if (connect(sl_sock, (struct sockaddr *)&sl_addr, sizeof(sl_addr)) < 0) {
-        error_exit("Error connecting to SL");
-    }
-
-    printf("Connected to SU and SL servers.\n");
-
-    char command[BUFSZ];
+    char line[256];
     while (1) {
-        printf("Enter command (add UID IS_SPECIAL, find UID, or kill): ");
-        fgets(command, BUFSZ, stdin);
+        printf("> ");
+        fflush(stdout);
+        if (!fgets(line, sizeof(line), stdin)) break;
 
-        if (strncmp(command, "add", 3) == 0) {
-            char uid[11];
-            int is_special;
-            if (sscanf(command + 4, "%10s %d", uid, &is_special) == 2) {
-                char payload[BUFSZ];
-                snprintf(payload, BUFSZ, "%s %d", uid, is_special);
-                send_message(su_sock, REQ_USRADD, payload);
-                receive_message(su_sock);
-            } else {
-                printf("Invalid command format. Usage: add UID IS_SPECIAL\n");
-            }
-        } else if (strncmp(command, "find", 4) == 0) {
-            char uid[11];
-            if (sscanf(command + 5, "%10s", uid) == 1) {
-                send_message(sl_sock, REQ_USRLOC, uid);
-                receive_message(sl_sock);
-            } else {
-                printf("Invalid command format. Usage: find UID\n");
-            }
-        } else if (strncmp(command, "kill", 4) == 0) {
-            send_message(su_sock, REQ_DISC, NULL);
-            send_message(sl_sock, REQ_DISC, NULL);
+        if (strncmp(line, "kill", 4) == 0) {
+            send(su_sock, "kill", 4, 0);
+            send(sl_sock, "kill", 4, 0);
+            printf("Cliente enviou 'kill' aos servidores.\n");
             break;
+        } else if (strncmp(line, "add ", 4) == 0) {
+            char uid[50];
+            int is_special;
+            if (sscanf(line, "add %s %d", uid, &is_special) == 2) {
+                char msg[128];
+                snprintf(msg, sizeof(msg), "%d %s %d", REQ_USRADD, uid, is_special);
+                send(su_sock, msg, strlen(msg), 0);
+                char resp[256];
+                recv(su_sock, resp, sizeof(resp), 0);
+                printf("%s\n", resp);
+            }
+        } else if (strncmp(line, "find ", 5) == 0) {
+            char uid[50];
+            if (sscanf(line, "find %s", uid) == 1) {
+                char msg[128];
+                snprintf(msg, sizeof(msg), "%d %s", REQ_USRLOC, uid);
+                send(sl_sock, msg, strlen(msg), 0);
+                char resp[256];
+                recv(sl_sock, resp, sizeof(resp), 0);
+                printf("%s\n", resp);
+            }
+        } else if (strncmp(line, "in ", 3) == 0) {
+            char uid[50];
+            if (sscanf(line, "in %s", uid) == 1) {
+                char msg[128];
+                snprintf(msg, sizeof(msg), "%d %s in", REQ_USRACCESS, uid);
+                send(su_sock, msg, strlen(msg), 0);
+                char resp[256];
+                recv(su_sock, resp, sizeof(resp), 0);
+                printf("SU: %s\n", resp);
+            }
+        } else if (strncmp(line, "out ", 4) == 0) {
+            char uid[50];
+            if (sscanf(line, "out %s", uid) == 1) {
+                char msg[128];
+                snprintf(msg, sizeof(msg), "%d %s out", REQ_USRACCESS, uid);
+                send(su_sock, msg, strlen(msg), 0);
+                char resp[256];
+                recv(su_sock, resp, sizeof(resp), 0);
+                printf("SU: %s\n", resp);
+            }
         } else {
-            printf("Unknown command.\n");
+            printf("Comando não reconhecido.\n");
         }
     }
 
     close(su_sock);
     close(sl_sock);
-    printf("Connections closed.\n");
     return EXIT_SUCCESS;
 }

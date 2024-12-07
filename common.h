@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <arpa/inet.h>
 
-
+// Message Types
 #define REQ_CONNPEER  17
 #define RES_CONNPEER  18
 #define REQ_DISCPEER  19
@@ -29,7 +29,21 @@
 #define ERROR         255
 #define OK            0
 
+// Error Codes
+#define ERR_PEER_LIMIT_EXCEEDED 1
+#define ERR_PEER_NOT_FOUND      2
+#define ERR_CLIENT_LIMIT        9
+#define ERR_CLIENT_NOT_FOUND    10
+#define ERR_USER_LIMIT          17
+#define ERR_USER_NOT_FOUND      18
+#define ERR_PERMISSION_DENIED   19
 
+// Confirmation Codes
+#define CONF_SUCCESS_DISC 1
+#define CONF_SUCCESS_CREATE 2
+#define CONF_SUCCESS_UPDATE 3
+
+// Function declarations
 void logexit(const char *msg);
 int addrparse(const char *addrstr, const char *portstr, struct sockaddr_storage *storage);
 void addrtostr(const struct sockaddr *addr, char *str, size_t strsize);
