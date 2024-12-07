@@ -1,142 +1,197 @@
-// client.c
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/socket.h>
-#include <netdb.h>
 #include <arpa/inet.h>
-#include "common.h"
+#include <netinet/in.h>
 
-#define REQ_USRADD 33
-#define REQ_USRACCESS 34
-#define RES_USRACCESS 35
-#define REQ_LOCREG 36
-#define REQ_USRLOC 38
-#define RES_USRLOC 39
-#define ERROR 255
-#define OK 0
+#define BUFFER_SIZE 500
 
-int connect_to_server(const char *host, const char *port) {
-    struct sockaddr_storage storage;
-    if (addrparse(host, port, &storage) != 0) {
-        fprintf(stderr, "Failed to parse host/port.\n");
-        return -1;
-    }
-
-    int s = socket(storage.ss_family, SOCK_STREAM, 0);
-    if (s == -1) {
-        perror("Error creating socket");
-        return -1;
-    }
-
-    socklen_t addrlen = (storage.ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
-
-    if (connect(s, (struct sockaddr *)&storage, addrlen) != 0) {
-        perror("Error connecting to server");
-        close(s);
-        return -1;
-    }
-
-    fprintf(stdout, "Connected to %s:%s\n", host, port);
-    return s;
-}
+void connect_to_server(const char *ip, int port, int *sock);
 
 int main(int argc, char *argv[]) {
-    if (argc < 5) {
-        fprintf(stderr, "Usage: %s <SU_HOST> <SU_PORT> <SL_PORT> <CLIENT_ID>\n", argv[0]);
+    if (argc != 5) {
+        fprintf(stderr, "Usage: %s <IP_SU> <Port_SU> <Port_SL> <LocID>\n", argv[0]);
         exit(EXIT_FAILURE);
     }
 
-    const char *su_host = argv[1];
-    const char *su_port = argv[2];
-    const char *sl_port = argv[3];
-    const char *client_id = argv[4];
-    fprintf(stdout, "Client ID: %s\n", client_id);
+    const char *ip_su = argv[1];
+    int port_su = atoi(argv[2]);
+    int port_sl = atoi(argv[3]);
+    int locId = atoi(argv[4]);
 
-    int su_sock = connect_to_server(su_host, su_port);
-    if (su_sock < 0) exit(EXIT_FAILURE);
-
-    int sl_sock = connect_to_server(su_host, sl_port);
-    if (sl_sock < 0) {
-        close(su_sock);
+    if (locId < 1 || locId > 10) {
+        fprintf(stderr, "Invalid LocID. Must be between 1 and 10.\n");
         exit(EXIT_FAILURE);
     }
 
-    char line[256];
+    int sock_su, sock_sl;
+    connect_to_server(ip_su, port_su, &sock_su);
+    connect_to_server(ip_su, port_sl, &sock_sl);
+
+    char command[BUFFER_SIZE], response[BUFFER_SIZE];
     while (1) {
-        printf("> ");
-        fflush(stdout);
-        if (!fgets(line, sizeof(line), stdin)) break;
+        printf("Enter command: ");
+        fgets(command, BUFFER_SIZE, stdin);
+        command[strcspn(command, "\n")] = 0; // Remove newline
 
-        if (strncmp(line, "kill", 4) == 0) {
-            send(su_sock, "kill", 4, 0);
-            send(sl_sock, "kill", 4, 0);
-            printf("Client sent 'kill' to servers.\n");
+        if (strncmp(command, "kill", 4) == 0) {
+            printf("Kill command received. Closing all connections and shutting down client.\n");
+            close(sock_su);
+            close(sock_sl);
             break;
-        } else if (strncmp(line, "add ", 4) == 0) {
-            char uid[50];
-            int is_special;
-            if (sscanf(line, "add %49s %d", uid, &is_special) == 2) {
-                char msg[128];
-                snprintf(msg, sizeof(msg), "%d %s %d", REQ_USRADD, uid, is_special);
-                send(su_sock, msg, strlen(msg), 0);
-                char resp[256];
-                memset(resp, 0, sizeof(resp));
-                if (recv(su_sock, resp, sizeof(resp), 0) > 0) {
-                    printf("%s", resp);
-                }
-            } else {
-                printf("Usage: add <UID> <IS_SPECIAL>\n");
+        }
+
+        if (strncmp(command, "add ", 4) == 0) {
+            char *uid = strtok(command + 4, " ");
+            char *is_special = strtok(NULL, " ");
+            if (!uid || strlen(uid) != 10 || !is_special || (*is_special != '0' && *is_special != '1')) {
+                printf("Invalid command format. Correct usage: add <UID (10 chars)> <IS_SPECIAL (0 or 1)>\n");
+                continue;
             }
-        } else if (strncmp(line, "find ", 5) == 0) {
-            char uid[50];
-            if (sscanf(line, "find %49s", uid) == 1) {
-                char msg[128];
-                snprintf(msg, sizeof(msg), "%d %s", REQ_USRLOC, uid);
-                send(sl_sock, msg, strlen(msg), 0);
-                char resp[256];
-                memset(resp, 0, sizeof(resp));
-                if (recv(sl_sock, resp, sizeof(resp), 0) > 0) {
-                    printf("%s", resp);
-                }
-            } else {
-                printf("Usage: find <UID>\n");
+
+            char message[BUFFER_SIZE];
+            snprintf(message, sizeof(message), "REQ_USRADD %s %s", uid, is_special);
+
+            send(sock_su, message, strlen(message), 0);
+            printf("> Sent: %s\n", message);
+
+            int bytes_received = read(sock_su, response, sizeof(response) - 1);
+            if (bytes_received > 0) {
+                response[bytes_received] = '\0';
+                printf("< Received: %s\n", response);
             }
-        } else if (strncmp(line, "in ", 3) == 0) {
-            char uid[50];
-            if (sscanf(line, "in %49s", uid) == 1) {
-                char msg[128];
-                snprintf(msg, sizeof(msg), "%d %s in", REQ_USRACCESS, uid);
-                send(su_sock, msg, strlen(msg), 0);
-                char resp[256];
-                memset(resp, 0, sizeof(resp));
-                if (recv(su_sock, resp, sizeof(resp), 0) > 0) {
-                    printf("SU: %s", resp);
-                }
-            } else {
-                printf("Usage: in <UID>\n");
+            continue;
+        }
+
+        if (strncmp(command, "find ", 5) == 0) {
+            char *uid = strtok(command + 5, " ");
+            if (!uid || strlen(uid) != 10) {
+                printf("Invalid command format. Correct usage: find <UID (10 chars)>\n");
+                continue;
             }
-        } else if (strncmp(line, "out ", 4) == 0) {
-            char uid[50];
-            if (sscanf(line, "out %49s", uid) == 1) {
-                char msg[128];
-                snprintf(msg, sizeof(msg), "%d %s out", REQ_USRACCESS, uid);
-                send(su_sock, msg, strlen(msg), 0);
-                char resp[256];
-                memset(resp, 0, sizeof(resp));
-                if (recv(su_sock, resp, sizeof(resp), 0) > 0) {
-                    printf("SU: %s", resp);
-                }
-            } else {
-                printf("Usage: out <UID>\n");
+
+            char message[BUFFER_SIZE];
+            snprintf(message, sizeof(message), "REQ_FIND %s", uid);
+
+            send(sock_sl, message, strlen(message), 0);
+            printf("> Sent: %s\n", message);
+
+            int bytes_received = read(sock_sl, response, sizeof(response) - 1);
+            if (bytes_received > 0) {
+                response[bytes_received] = '\0';
+                printf("< Received: %s\n", response);
             }
-        } else {
-            printf("Unknown command.\n");
+            continue;
+        }
+
+        if (strncmp(command, "in ", 3) == 0 || strncmp(command, "out ", 4) == 0) {
+            char *uid = strtok(command + ((command[1] == 'n') ? 3 : 4), " ");
+            if (!uid || strlen(uid) != 10) {
+                printf("Invalid command format. Correct usage: in <UID (10 chars)> or out <UID (10 chars)>\n");
+                continue;
+            }
+
+            char *direction = (strncmp(command, "in ", 3) == 0) ? "in" : "out";
+
+            char message[BUFFER_SIZE];
+            snprintf(message, sizeof(message), "REQ_USRACCESS %s %s", uid, direction);
+
+            send(sock_su, message, strlen(message), 0);
+            printf("> Sent: %s\n", message);
+
+            int bytes_received = read(sock_su, response, sizeof(response) - 1);
+            if (bytes_received > 0) {
+                response[bytes_received] = '\0';
+                if (strncmp(response, "ERROR(18)", 9) == 0) {
+                    printf("< Received: ERROR(18) - User not found.\n");
+                } else {
+                    printf("< Received: Ok. Last location: %s\n", response + 15);
+                }
+            }
+            continue;
+        }
+
+        if (strncmp(command, "inspect ", 8) == 0) {
+            char *uid = strtok(command + 8, " ");
+            char *loc_id = strtok(NULL, " ");
+            if (!uid || strlen(uid) != 10 || !loc_id) {
+                printf("Invalid command format. Correct usage: inspect <UID (10 chars)> <LocId>\n");
+                continue;
+            }
+
+            char message[BUFFER_SIZE];
+            snprintf(message, sizeof(message), "REQ_LOCLIST %s %s", uid, loc_id);
+
+            send(sock_sl, message, strlen(message), 0);
+            printf("> Sent: %s\n", message);
+
+            int bytes_received = read(sock_sl, response, sizeof(response) - 1);
+            if (bytes_received > 0) {
+                response[bytes_received] = '\0';
+                if (strncmp(response, "ERROR(19)", 9) == 0) {
+                    printf("< Received: ERROR(19) - Permission denied.\n");
+                } else if (strncmp(response, "RES_LOCLIST", 11) == 0) {
+                    printf("< Received: List of people at the specified location: %s\n", response + 12);
+                } else {
+                    printf("< Received: Unknown response: %s\n", response);
+                }
+            }
+            continue;
+        }
+
+        printf("Unknown command.\n");
+    }
+
+    return 0;
+}
+
+void connect_to_server(const char *ip, int port, int *sock) {
+    struct sockaddr_in6 serv_addr6;
+    struct sockaddr_in serv_addr;
+    int is_ipv6 = strchr(ip, ':') != NULL; // Verifica se o endereço contém ":" para identificar IPv6
+
+    // Cria o socket apropriado para IPv4 ou IPv6
+    if ((*sock = socket(is_ipv6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0)) < 0) {
+        perror("Error creating socket");
+        exit(EXIT_FAILURE);
+    }
+
+    if (is_ipv6) {
+        // Configuração para IPv6
+        memset(&serv_addr6, 0, sizeof(serv_addr6));
+        serv_addr6.sin6_family = AF_INET6;
+        serv_addr6.sin6_port = htons(port);
+
+        if (inet_pton(AF_INET6, ip, &serv_addr6.sin6_addr) <= 0) {
+            perror("Invalid IPv6 address");
+            close(*sock);
+            exit(EXIT_FAILURE);
+        }
+
+        if (connect(*sock, (struct sockaddr *)&serv_addr6, sizeof(serv_addr6)) < 0) {
+            perror("Error connecting to IPv6 server");
+            close(*sock);
+            exit(EXIT_FAILURE);
+        }
+    } else {
+        // Configuração para IPv4
+        memset(&serv_addr, 0, sizeof(serv_addr));
+        serv_addr.sin_family = AF_INET;
+        serv_addr.sin_port = htons(port);
+
+        if (inet_pton(AF_INET, ip, &serv_addr.sin_addr) <= 0) {
+            perror("Invalid IPv4 address");
+            close(*sock);
+            exit(EXIT_FAILURE);
+        }
+
+        if (connect(*sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+            perror("Error connecting to IPv4 server");
+            close(*sock);
+            exit(EXIT_FAILURE);
         }
     }
 
-    close(su_sock);
-    close(sl_sock);
-    return EXIT_SUCCESS;
+    printf("Connected to server on port %d\n", port);
 }

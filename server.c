@@ -1,301 +1,409 @@
-// server.c
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/socket.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/select.h>
 #include <errno.h>
-#include "common.h"
 
-#define MAX_CLIENTS 100
-#define MAX_PEOPLE 100
-#define BUFFER_SIZE 256
-
-// Tipos
-#define REQ_USRADD    33
-#define REQ_USRACCESS 34
-#define REQ_LOCREG    36
-#define REQ_USRLOC    38
-#define ERROR         255
-#define OK            0
-
-#define ERR_USER_NOT_FOUND 18
-#define ERR_USER_LIMIT     17
+#define MAX_CLIENTS 10
+#define MAX_USERS 30
+#define BUFFER_SIZE 500
 
 typedef struct {
-    int id;
-    int sock;
-    int loc; // Pode ser usado como identificação da localização do cliente
-} Client;
+    char uid[11];
+    int is_special;
+    int location;
+} User;
 
-typedef struct {
-    int id;
-    char name[50];
-    int loc; // localização atual (-1 se não definida)
-} Person;
+User users[MAX_USERS];
+int user_count = 0;
 
-static Client clients[MAX_CLIENTS];
-static Person people[MAX_PEOPLE];
-static int client_count = 0;
-static int person_count = 0;
-static int peer_connected = 0;
+// Added for peer connection
+int peer_sock = -1;
+int my_peer_id = -1;
+int peer_id = -1;
 
-void send_message(int sock, const char *msg) {
-    if (sock >= 0 && msg) {
-        send(sock, msg, strlen(msg), 0);
-    }
-}
-
-int find_person_index(const char *uid) {
-    for (int i = 0; i < person_count; i++) {
-        if (strcmp(people[i].name, uid) == 0) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-void register_person_server(int sock, const char *uid, int loc) {
-    if (person_count >= MAX_PEOPLE) {
-        char response[BUFFER_SIZE];
-        snprintf(response, sizeof(response), "> ERROR %d\n", ERR_USER_LIMIT);
-        send_message(sock, response);
-        return;
-    }
-    people[person_count].id = person_count + 1;
-    strncpy(people[person_count].name, uid, sizeof(people[person_count].name) - 1);
-    people[person_count].loc = loc;
-    person_count++;
-
-    char response[BUFFER_SIZE];
-    snprintf(response, sizeof(response), "> OK %d\n", people[person_count - 1].id);
-    send_message(sock, response);
-}
-
-void locate_person_server(int sock, const char *uid) {
-    int idx = find_person_index(uid);
-    if (idx < 0) {
-        // Não encontrada
-        char response[BUFFER_SIZE];
-        snprintf(response, sizeof(response), "> ERROR %d\n", ERR_USER_NOT_FOUND);
-        send_message(sock, response);
-        return;
-    }
-
-    if (people[idx].loc == -1) {
-        // Usuário sem localização conhecida
-        char response[BUFFER_SIZE];
-        snprintf(response, sizeof(response), "> ERROR %d\n", ERR_USER_NOT_FOUND);
-        send_message(sock, response);
-        return;
-    }
-
-    // Retorna localização
-    char response[BUFFER_SIZE];
-    snprintf(response, sizeof(response), "> RES_USRLOC %d\n", people[idx].loc);
-    send_message(sock, response);
-}
-
-void user_access_server(int sock, const char *uid, const char *action) {
-    int idx = find_person_index(uid);
-    if (idx < 0) {
-        // Usuario não encontrado
-        char response[BUFFER_SIZE];
-        snprintf(response, sizeof(response), "> ERROR %d\n", ERR_USER_NOT_FOUND);
-        send_message(sock, response);
-        return;
-    }
-
-    if (strcmp(action, "in") == 0) {
-        // marca que usuário entrou (loc != -1)
-        // Para simplificar, vamos atribuir loc = 1
-        people[idx].loc = 1;
-        send_message(sock, "> OK\n");
-    } else if (strcmp(action, "out") == 0) {
-        // marca que usuário saiu
-        // loc = -1 significa sem localização
-        people[idx].loc = -1;
-        send_message(sock, "> OK\n");
-    } else {
-        // Ação desconhecida
-        send_message(sock, "> ERROR 255\n");
-    }
-}
-
-void handle_message(int sock, const char *msg) {
-    if (strncmp(msg, "kill", 4) == 0) {
-        // kill recebido: desconecta cliente
-        send_message(sock, "SU Successful disconnect\n");
-        close(sock);
-        for (int i = 0; i < client_count; i++) {
-            if (clients[i].sock == sock) {
-                clients[i].sock = 0;
-                break;
-            }
-        }
-        return;
-    }
-
-    int code;
-    char uid[50];
-    int spec;
-
-    // Tenta interpretar REQ_USRADD (33 UID IS_SPECIAL)
-    if (sscanf(msg, "%d %49s %d", &code, uid, &spec) == 3 && code == REQ_USRADD) {
-        register_person_server(sock, uid, spec);
-        return;
-    }
-
-    // Tenta interpretar REQ_USRLOC (38 UID)
-    if (sscanf(msg, "%d %49s", &code, uid) == 2 && code == REQ_USRLOC) {
-        locate_person_server(sock, uid);
-        return;
-    }
-
-    // Tenta interpretar REQ_USRACCESS (34 UID in/out)
-    {
-        char action[10];
-        if (sscanf(msg, "%d %49s %9s", &code, uid, action) == 3 && code == REQ_USRACCESS) {
-            user_access_server(sock, uid, action);
-            return;
-        }
-    }
-
-    // Caso não reconheça o comando
-    send_message(sock, "> ERROR 255\n");
-}
-
-void accept_client(int listen_sock) {
-    struct sockaddr_storage cstorage;
-    socklen_t clen = sizeof(cstorage);
-    int csock = accept(listen_sock, (struct sockaddr *)&cstorage, &clen);
-    if (csock < 0) {
-        perror("accept");
-        return;
-    }
-
-    if (client_count >= MAX_CLIENTS) {
-        fprintf(stdout, "Peer limit exceeded\n");
-        close(csock);
-        return;
-    }
-
-    clients[client_count].id = client_count + 1;
-    clients[client_count].sock = csock;
-    clients[client_count].loc = -1;
-    fprintf(stdout, "New user added: %d\n", clients[client_count].id);
-    client_count++;
-}
+void handle_client_message(int client_sock, fd_set *readfds, int client_sockets[]);
+void handle_peer_message(int sock);
 
 int main(int argc, char *argv[]) {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <peer_port> <this_port>\n", argv[0]);
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <Peer_Port> <Client_Port>\n", argv[0]);
         exit(EXIT_FAILURE);
     }
 
-    const char *peer_port = argv[1];
-    const char *this_port = argv[2];
+    int peer_port = atoi(argv[1]);
+    int client_port = atoi(argv[2]);
 
-    fprintf(stdout, "Peer port: %s, This port: %s\n", peer_port, this_port);
+    int server_sock, peer_listen_sock, new_socket, max_sd, activity;
+    struct sockaddr_in6 address6, peer_addr6;
+    fd_set readfds;
+    int client_sockets[MAX_CLIENTS] = {0};
 
-    // Tenta conectar ao peer (IPv4)
-    struct sockaddr_storage peer_storage;
-    if (server_sockaddr_init("v4", peer_port, &peer_storage) == 0) {
-        int psock = socket(peer_storage.ss_family, SOCK_STREAM, 0);
-        if (psock >= 0) {
-            socklen_t addrlen = (peer_storage.ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
-            if (connect(psock, (struct sockaddr *)&peer_storage, addrlen) != 0) {
-                fprintf(stdout, "No peer found, starting to listen...\n");
-                close(psock);
-            } else {
-                fprintf(stdout, "Peer 5 connected\n");
-                peer_connected = 1;
-                close(psock);
+    // Create client socket
+    if ((server_sock = socket(AF_INET6, SOCK_STREAM, 0)) == 0) {
+        perror("Error creating socket");
+        exit(EXIT_FAILURE);
+    }
+
+    // Create peer socket
+    if ((peer_listen_sock = socket(AF_INET6, SOCK_STREAM, 0)) == 0) {
+        perror("Error creating peer socket");
+        exit(EXIT_FAILURE);
+    }
+
+    int opt = 1;
+    setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(peer_listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    // Configure client address
+    memset(&address6, 0, sizeof(address6));
+    address6.sin6_family = AF_INET6;
+    address6.sin6_addr = in6addr_any;
+    address6.sin6_port = htons(client_port);
+
+    // Configure peer address
+    memset(&peer_addr6, 0, sizeof(peer_addr6));
+    peer_addr6.sin6_family = AF_INET6;
+    peer_addr6.sin6_addr = in6addr_any;
+    peer_addr6.sin6_port = htons(peer_port);
+
+    // Bind client socket
+    if (bind(server_sock, (struct sockaddr *)&address6, sizeof(address6)) < 0) {
+        perror("Error binding socket");
+        exit(EXIT_FAILURE);
+    }
+
+    // Try to bind peer socket
+    if (bind(peer_listen_sock, (struct sockaddr *)&peer_addr6, sizeof(peer_addr6)) < 0) {
+        if (errno == EADDRINUSE) {
+            // Try to connect to existing peer
+            struct sockaddr_in6 peer_connect_addr;
+            int connect_sock = socket(AF_INET6, SOCK_STREAM, 0);
+            
+            memset(&peer_connect_addr, 0, sizeof(peer_connect_addr));
+            peer_connect_addr.sin6_family = AF_INET6;
+            inet_pton(AF_INET6, "::1", &peer_connect_addr.sin6_addr);
+            peer_connect_addr.sin6_port = htons(peer_port);
+
+            if (connect(connect_sock, (struct sockaddr *)&peer_connect_addr, sizeof(peer_connect_addr)) < 0) {
+                perror("Connect failed");
+                exit(EXIT_FAILURE);
             }
+
+            send(connect_sock, "REQ_CONNPEER()", 13, 0);
+            peer_sock = connect_sock;
         } else {
-            fprintf(stdout, "No peer found, starting to listen...\n");
+            perror("Bind failed for peer socket");
+            exit(EXIT_FAILURE);
         }
     } else {
-        fprintf(stdout, "No peer found, starting to listen...\n");
+        if (listen(peer_listen_sock, 1) < 0) {
+            perror("Listen failed for peer socket");
+            exit(EXIT_FAILURE);
+        }
+        printf("No peer found, starting to listen...\n");
     }
 
-    // Cadastro inicial para teste
-    // Como sugerido, já deixamos algo cadastrado para teste:
-    // Caso queira testar localização com sucesso, descomente a linha abaixo:
-    // register_person_server(-1, "2021808080", 7);
-    // Por padrão, deixaremos Alice com loc=10
-    person_count = 0; // limpamos para evitar duplo cadastro
-    people[person_count].id = 1;
-    strncpy(people[person_count].name, "Alice", sizeof(people[person_count].name)-1);
-    people[person_count].loc = 10;
-    person_count++;
-
-    struct sockaddr_storage storage;
-    if (server_sockaddr_init("v4", this_port, &storage) != 0) {
-        fprintf(stderr, "Error setting up server.\n");
+    // Listen for client connections
+    if (listen(server_sock, MAX_CLIENTS) < 0) {
+        perror("Error listening");
         exit(EXIT_FAILURE);
     }
 
-    int listen_sock = socket(storage.ss_family, SOCK_STREAM, 0);
-    if (listen_sock < 0) logexit("socket");
-
-    int enable = 1;
-    if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) < 0) {
-        logexit("setsockopt");
-    }
-
-    if (bind(listen_sock, (struct sockaddr *)&storage, sizeof(struct sockaddr_in)) != 0) {
-        logexit("bind");
-    }
-
-    if (listen(listen_sock, 10) != 0) {
-        logexit("listen");
-    }
-
-    fprintf(stdout, "Starting to listen on port %s\n", this_port);
-
     while (1) {
-        fd_set readfds;
         FD_ZERO(&readfds);
+        FD_SET(server_sock, &readfds);
+        FD_SET(STDIN_FILENO, &readfds);
+        max_sd = server_sock;
 
-        FD_SET(listen_sock, &readfds);
-        int max_fd = listen_sock;
+        // Add peer listener if not connected
+        if (peer_sock == -1 && peer_listen_sock > 0) {
+            FD_SET(peer_listen_sock, &readfds);
+            max_sd = peer_listen_sock > max_sd ? peer_listen_sock : max_sd;
+        }
 
-        for (int i = 0; i < client_count; i++) {
-            if (clients[i].sock > 0) {
-                FD_SET(clients[i].sock, &readfds);
-                if (clients[i].sock > max_fd) max_fd = clients[i].sock;
+        // Add peer socket if connected
+        if (peer_sock != -1) {
+            FD_SET(peer_sock, &readfds);
+            max_sd = peer_sock > max_sd ? peer_sock : max_sd;
+        }
+
+        // Add client sockets
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            int sd = client_sockets[i];
+            if (sd > 0) {
+                FD_SET(sd, &readfds);
+                max_sd = sd > max_sd ? sd : max_sd;
             }
         }
 
-        int activity = select(max_fd + 1, &readfds, NULL, NULL, NULL);
+        activity = select(max_sd + 1, &readfds, NULL, NULL, NULL);
         if (activity < 0 && errno != EINTR) {
-            perror("select");
+            perror("Select failed");
         }
 
-        if (FD_ISSET(listen_sock, &readfds)) {
-            accept_client(listen_sock);
-        }
-
-        for (int i = 0; i < client_count; i++) {
-            if (clients[i].sock > 0 && FD_ISSET(clients[i].sock, &readfds)) {
-                char buffer[BUFFER_SIZE];
-                memset(buffer, 0, sizeof(buffer));
-
-                int valread = recv(clients[i].sock, buffer, sizeof(buffer) - 1, 0);
-                if (valread == 0) {
-                    fprintf(stdout, "Client %d removed (Loc %d)\n", clients[i].id, clients[i].loc);
-                    close(clients[i].sock);
-                    clients[i].sock = 0;
-                } else {
-                    fprintf(stderr, "< %s\n", buffer);
-                    handle_message(clients[i].sock, buffer);
+        // Handle kill command
+        if (FD_ISSET(STDIN_FILENO, &readfds)) {
+            char input[BUFFER_SIZE];
+            if (fgets(input, BUFFER_SIZE, stdin) != NULL) {
+                if (strncmp(input, "kill", 4) == 0) {
+                    if (peer_sock != -1) {
+                        char msg[BUFFER_SIZE];
+                        snprintf(msg, sizeof(msg), "REQ_DISCPEER(%d)", my_peer_id);
+                        send(peer_sock, msg, strlen(msg), 0);
+                        close(peer_sock);
+                    }
+                    for (int i = 0; i < MAX_CLIENTS; i++) {
+                        if (client_sockets[i] > 0) {
+                            close(client_sockets[i]);
+                        }
+                    }
+                    close(server_sock);
+                    exit(0);
                 }
             }
         }
+
+        // Handle new peer connection
+        if (peer_listen_sock > 0 && FD_ISSET(peer_listen_sock, &readfds)) {
+            if ((new_socket = accept(peer_listen_sock, NULL, NULL)) < 0) {
+                perror("Peer accept failed");
+            } else if (peer_sock != -1) {
+                send(new_socket, "ERROR(01)", 9, 0);
+                close(new_socket);
+            } else {
+                peer_sock = new_socket;
+                printf("Peer 5 connected\n");
+            }
+        }
+
+        // Handle new client connection
+        if (FD_ISSET(server_sock, &readfds)) {
+            if ((new_socket = accept(server_sock, NULL, NULL)) < 0) {
+                perror("Error accepting connection");
+                exit(EXIT_FAILURE);
+            }
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                if (client_sockets[i] == 0) {
+                    client_sockets[i] = new_socket;
+                    printf("Client connected, socket %d\n", new_socket);
+                    break;
+                }
+            }
+        }
+
+        // Handle peer messages
+        if (peer_sock != -1 && FD_ISSET(peer_sock, &readfds)) {
+            handle_peer_message(peer_sock);
+        }
+
+        // Handle client messages
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            int sd = client_sockets[i];
+            if (FD_ISSET(sd, &readfds)) {
+                handle_client_message(sd, &readfds, client_sockets);
+            }
+        }
     }
 
-    close(listen_sock);
-    return EXIT_SUCCESS;
+    return 0;
+}
+
+void handle_peer_message(int sock) {
+    char buffer[BUFFER_SIZE];
+    int bytes_read = recv(sock, buffer, sizeof(buffer) - 1, 0);
+    
+    if (bytes_read <= 0) {
+        close(sock);
+        peer_sock = -1;
+        printf("No peer found, starting to listen...\n");
+        return;
+    }
+
+    buffer[bytes_read] = '\0';
+    
+    if (strncmp(buffer, "REQ_CONNPEER()", 13) == 0) {
+        char res[BUFFER_SIZE];
+        snprintf(res, sizeof(res), "RES_CONNPEER(%d)", 9);
+        send(sock, res, strlen(res), 0);
+        my_peer_id = 9;
+        peer_id = 5;
+    }
+    else if (strncmp(buffer, "RES_CONNPEER", 12) == 0) {
+        int pid;
+        if (sscanf(buffer, "RES_CONNPEER(%d)", &pid) == 1) {
+            peer_id = pid;
+            my_peer_id = 5;
+            printf("New Peer ID: %d\n", my_peer_id);
+            printf("Peer %d connected\n", peer_id);
+        }
+    }
+    else if (strncmp(buffer, "REQ_DISCPEER", 12) == 0) {
+        int pid;
+        if (sscanf(buffer, "REQ_DISCPEER(%d)", &pid) == 1) {
+            if (pid == peer_id) {
+                send(sock, "OK(01)", 6, 0);
+                close(sock);
+                peer_sock = -1;
+                printf("Peer %d disconnected\n", pid);
+                printf("No peer found, starting to listen...\n");
+            } else {
+                send(sock, "ERROR(02)", 9, 0);
+            }
+        }
+    }
+}
+
+void handle_client_message(int client_sock, fd_set *readfds, int client_sockets[]) {
+    char buffer[BUFFER_SIZE];
+    int valread = read(client_sock, buffer, sizeof(buffer));
+
+    if (valread == 0) {
+        printf("Client disconnected, socket %d\n", client_sock);
+        FD_CLR(client_sock, readfds);
+        close(client_sock);
+
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (client_sockets[i] == client_sock) {
+                client_sockets[i] = 0;
+                break;
+            }
+        }
+
+        return;
+    }
+
+    buffer[valread] = '\0';
+
+    // Handle REQ_USRADD command
+    if (strncmp(buffer, "REQ_USRADD ", 11) == 0) {
+        char *uid = strtok(buffer + 11, " ");
+        char *is_special = strtok(NULL, " ");
+        if (!uid || strlen(uid) != 10 || !is_special || (*is_special != '0' && *is_special != '1')) {
+            send(client_sock, "Invalid REQ_USRADD format.\n", 27, 0);
+            printf("< %s\n", buffer);  // Log message received on server
+        } else if (user_count >= MAX_USERS) {
+            send(client_sock, "User limit exceeded.\n", 21, 0);
+            printf("< %s\n", buffer);  // Log message received on server
+        } else {
+            strcpy(users[user_count].uid, uid);
+            users[user_count].is_special = atoi(is_special);
+            users[user_count].location = -1; // Default location
+            user_count++;
+            send(client_sock, "OK 2\n", 6, 0);
+            printf("< %s\n", buffer);  // Log message received on server
+        }
+    }
+    // Handle REQ_USRACCESS command (for in/out)
+    else if (strncmp(buffer, "REQ_USRACCESS ", 14) == 0) {
+        char *uid = strtok(buffer + 14, " ");
+        char *direction = strtok(NULL, " ");
+        if (!uid || strlen(uid) != 10 || !direction || (strcmp(direction, "in") != 0 && strcmp(direction, "out") != 0)) {
+            send(client_sock, "Invalid REQ_USRACCESS format.\n", 30, 0);
+            printf("< %s\n", buffer);  // Log message received on server
+        } else {
+            int found = 0;
+            for (int i = 0; i < user_count; i++) {
+                if (strcmp(users[i].uid, uid) == 0) {
+                    found = 1;
+
+                    // Retrieve old location
+                    int old_loc = users[i].location;
+
+                    // Update location based on direction
+                    if (strcmp(direction, "in") == 0) {
+                        users[i].location = i + 1; // Example: Location = i + 1 for simplicity
+                    } else if (strcmp(direction, "out") == 0) {
+                        users[i].location = -1;
+                    }
+
+                    // Send response to client
+                    char response[BUFFER_SIZE];
+                    snprintf(response, sizeof(response), "RES_USRACCESS %d", old_loc);
+                    send(client_sock, response, strlen(response), 0);
+                    printf("< %s\n", buffer);  // Log message received on server
+                    break;
+                }
+            }
+            if (!found) {
+                send(client_sock, "ERROR(18)", 9, 0);
+                printf("< %s\n", buffer);  // Log message received on server
+            }
+        }
+    }
+    // Handle REQ_FIND command
+    else if (strncmp(buffer, "REQ_FIND ", 9) == 0) {
+        char *uid = strtok(buffer + 9, " ");
+        if (!uid || strlen(uid) != 10) {
+            send(client_sock, "Invalid REQ_FIND format.\n", 25, 0);
+            printf("< %s\n", buffer);  // Log message received on server
+        } else {
+            int found = 0;
+            for (int i = 0; i < user_count; i++) {
+                if (strcmp(users[i].uid, uid) == 0) {
+                    char response[BUFFER_SIZE];
+                    snprintf(response, sizeof(response), "User found: Location=%d, Special=%d\n",
+                             users[i].location, users[i].is_special);
+                    send(client_sock, response, strlen(response), 0);
+                    printf("< %s\n", buffer);  // Log message received on server
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) {
+                send(client_sock, "User not found.\n", 17, 0);
+                printf("< %s\n", buffer);  // Log message received on server
+            }
+        }
+    }
+    // Handle REQ_LOCLIST command (for inspect)
+    else if (strncmp(buffer, "REQ_LOCLIST ", 12) == 0) {
+        char *uid = strtok(buffer + 12, " ");
+        char *loc_id_str = strtok(NULL, " ");
+        int loc_id = atoi(loc_id_str);
+
+        if (!uid || strlen(uid) != 10 || !loc_id_str) {
+            send(client_sock, "Invalid REQ_LOCLIST format.\n", 29, 0);
+            printf("< %s\n", buffer);  // Log message received on server
+            return;
+        }
+
+        // Check if user has permission via REQ_USRAUTH
+        int has_permission = 0;
+        for (int i = 0; i < user_count; i++) {
+            if (strcmp(users[i].uid, uid) == 0) {
+                has_permission = users[i].is_special;
+                break;
+            }
+        }
+
+        if (!has_permission) {
+            send(client_sock, "ERROR(19)", 9, 0); // Permission denied
+            printf("< %s\n", buffer);  // Log message received on server
+        } else {
+            // Build list of users in location
+            char loclist_message[BUFFER_SIZE] = "RES_LOCLIST ";
+            int has_users = 0;
+            for (int i = 0; i < user_count; i++) {
+                if (users[i].location == loc_id) {
+                    if (has_users) strcat(loclist_message, ", ");
+                    strcat(loclist_message, users[i].uid);
+                    has_users = 1;
+                }
+            }
+            if (!has_users) {
+                strcat(loclist_message, "No users found");
+            }
+            send(client_sock, loclist_message, strlen(loclist_message), 0);
+            printf("< %s\n", buffer);  // Log message received on server
+        }
+    }
+    // Handle unknown commands
+    else {
+        send(client_sock, "Unknown command.\n", 18, 0);
+        printf("< %s\n", buffer);  // Log message received on server
+    }
 }
