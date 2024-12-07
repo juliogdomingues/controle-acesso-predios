@@ -1,3 +1,4 @@
+// common.c
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,9 +49,9 @@ int addrparse(const char *addrstr, const char *portstr, struct sockaddr_storage 
 }
 
 void addrtostr(const struct sockaddr *addr, char *str, size_t strsize) {
-    int version = 0;  // Inicialização
+    int version = 0;
     char addrstr[INET6_ADDRSTRLEN + 1] = "";
-    uint16_t port = 0;  // Inicialização
+    uint16_t port = 0;
 
     if (addr->sa_family == AF_INET) {
         version = 4;

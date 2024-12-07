@@ -1,3 +1,4 @@
+// common.h
 #ifndef COMMON_H
 #define COMMON_H
 
@@ -43,7 +44,6 @@
 #define CONF_SUCCESS_CREATE 2
 #define CONF_SUCCESS_UPDATE 3
 
-// Function declarations
 void logexit(const char *msg);
 int addrparse(const char *addrstr, const char *portstr, struct sockaddr_storage *storage);
 void addrtostr(const struct sockaddr *addr, char *str, size_t strsize);
