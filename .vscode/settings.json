@@ -1,6 +1,10 @@
 {
     "files.associations": {
         "unistd.h": "c",
-        "stdio.h": "c"
+        "stdio.h": "c",
+        "fcntl.h": "c",
+        "socket.h": "c",
+        "stdarg.h": "c",
+        "stdlib.h": "c"
     }
 }
